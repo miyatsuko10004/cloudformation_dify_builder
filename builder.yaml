@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Dify Environment with CloudFront, ALB, and EC2
+  - CloudFront → ALB → EC2 の三層構成
+  - ACM 証明書、VPC、Subnet、セキュリティグループ、IAM ロールをパラメーターで指定
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "スタック設定"
+        Parameters:
+          - OnFailure
+
+Parameters:
+  OnFailure:
+    Description: スタック作成失敗時の動作
+    Type: String
+    Default: DELETE
+    AllowedValues: [DELETE, ROLLBACK, DO_NOTHING]
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+
+  InstanceType:
+    Description: EC2 instance type (T3〜M8g)
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m8g.medium
+      - m8g.large
+      - m8g.xlarge
+      - m8g.2xlarge
+
+  CloudFrontCertARN:
+    Description: CloudFront用のACM証明書のARN（us-east-1で発行したもの）
+    Type: String
+    Default: arn:aws:acm:us-east-1:333333333333:certificate/123456789123456789
+
+  ALBCertARN:
+    Description: ALB用のACM証明書のARN（VPCと同じリージョンで発行したもの）
+    Type: String
+    Default: arn:aws:acm:ap-northeast-1:333333333333:certificate/987654321987654321
+
+  EC2VpcId:
+    Description: EC2 を配置する VPC の ID
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-123456789
+
+  EC2SubnetId:
+    Description: EC2 インスタンスを配置する **パブリック** Subnet ID
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0123456789
+
+  ECSecurityGroupId:
+    Description: EC2 用に利用するセキュリティグループの ID
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-0123456789
+
+  EC2IAMRole:
+    Description: EC2 インスタンスにアタッチする IAM ロール (Instance Profile 名)
+    Type: String
+    Default: hoge
+
+  ALBVpcId:
+    Description: ALB を配置する VPC の ID
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-123456789
+
+  ALBSubnetIds:
+    Description: >
+      ALB を配置するサブネット ID のリスト (AZから最低2つ)
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: "subnet-0123456789,subnet-123456789"
+
+  CloudFrontDomainName:
+    Description: CloudFrontのAlternate domain name
+    Type: String
+    Default: ""
+
+  DomainName:
+    Description: アプリケーションのドメイン名 (例: example.com)
+    Type: String
+    Default: "example.com"
+
+Conditions:
+  HasCloudFrontDomain: !Not [!Equals [!Ref CloudFrontDomainName, ""]]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ────────────────────────────────
+  # ALB 用 Security Group
+  # ────────────────────────────────
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the ALB
+      VpcId: !Ref ALBVpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # ────────────────────────────────
+  # EC2 インスタンス (Dify)
+  # ────────────────────────────────
+  DifyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName:      !Ref KeyName
+      ImageId: !Sub "resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !Ref EC2SubnetId
+          GroupSet:
+            - !Ref ECSecurityGroupId
+
+      IamInstanceProfile: !Ref EC2IAMRole
+      Tags:
+        - Key: Name
+          Value: DifyServer
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          yum update -y
+          amazon-linux-extras install docker -y
+          systemctl start docker
+          usermod -a -G docker ec2-user
+          curl -L "https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+          ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
+          yum install git -y
+          cd /home/ec2-user
+          git clone https://github.com/langgenius/dify.git
+          cd dify/docker
+          
+          # 指定された環境変数を.envファイルに書き込む
+          cat <<EOF > .env
+          CONSOLE_WEB_URL=https://${DomainName}
+          CONSOLE_API_URL=https://${DomainName}
+          SERVICE_API_URL=https://${DomainName}
+          EOF
+          
+          # 既存の.env.exampleから他の必要な設定をコピー
+          cat .env.example | grep -v "CONSOLE_WEB_URL\|CONSOLE_API_URL\|SERVICE_API_URL" >> .env
+          
+          # Dockerコンテナを起動
+          docker-compose up -d
+
+  # ────────────────────────────────
+  # Application Load Balancer
+  # ────────────────────────────────
+  DifyALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name:  DifyALB
+      Scheme: internet-facing
+      Subnets: !Ref ALBSubnetIds
+      SecurityGroups: [!Ref ALBSecurityGroup]
+      Type: application
+
+  DifyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: DifyTG
+      VpcId: !Ref ALBVpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      Targets:
+        - Id: !Ref DifyInstance
+          Port: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "80"
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: "200-399"
+
+  # ────────────────────────────────
+  # 443 番 (HTTPS) リスナー
+  # ────────────────────────────────
+  DifyALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DifyALB
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref ALBCertARN
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DifyTargetGroup
+
+  # ────────────────────────────────
+  # 80 番 (HTTP) リスナー
+  # ────────────────────────────────
+  DifyALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DifyALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DifyTargetGroup
+
+  # ────────────────────────────────
+  # CloudFront
+  # ────────────────────────────────
+  DifyCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Aliases:
+          !If [HasCloudFrontDomain, [!Ref CloudFrontDomainName], !Ref "AWS::NoValue"]
+        DefaultCacheBehavior:
+          ViewerProtocolPolicy: redirect-to-https
+          TargetOriginId: alb-origin
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: true
+            Headers:
+              - "*"
+            Cookies: { Forward: all }
+          MinTTL: 0
+          DefaultTTL: 0
+          MaxTTL: 0
+        Origins:
+          - DomainName: !GetAtt DifyALB.DNSName
+            Id: alb-origin
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultRootObject: index.html
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CloudFrontCertARN
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  CloudFrontURL:
+    Description: CloudFront URL to access Dify
+    Value: !Sub "https://${DifyCloudFrontDistribution.DomainName}"
+
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt DifyALB.DNSName
+
+  EC2InstanceId:
+    Description: ID of the EC2 instance running Dify
+    Value: !Ref DifyInstance
